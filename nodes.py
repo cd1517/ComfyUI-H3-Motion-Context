@@ -42,16 +42,8 @@ try:
 except ImportError:  # ComfyUI always ships safetensors; belt and braces
     _st_load = _st_save = None
 
-from .patch_layout import (
-    MC_KEY,
-    MC_AUDIO_KEY,
-    apply_patch as _apply_layout_patch,
-    is_applied as _layout_patch_applied,
-)
-from .patch_payload import (
-    apply_patch as _apply_payload_patch,
-    is_applied as _payload_patch_applied,
-)
+from .layout_contract import ensure as _ensure_layout_contract
+from .layout_contract import is_checked as _layout_checked
 
 try:
     import torchaudio
@@ -61,42 +53,20 @@ except ImportError:
 _LOG = logging.getLogger("h3_motion_context")
 
 
-def _ensure_layout_patch():
-    """Install the layout patch, once, the first time a node runs.
+def _ensure_layout_ok():
+    """Prove ComfyUI still places anchors the way this pack needs, once.
 
-    ComfyUI imports every folder in custom_nodes at startup, so patching
-    at import time would put this pack's wrappers in the path of every H3
-    graph on the machine, including graphs that never go near these
-    nodes. Installing on first use instead means the pack sitting in
-    custom_nodes changes nothing at all until you actually chain a clip.
+    This used to install two runtime patches. ComfyUI 0.33 does natively
+    what they existed to do, so the node now builds plain keyframe dicts
+    and only has to check that the arithmetic behind them still holds. See
+    layout_contract.py for what is checked and why it is not free.
 
-    The cost is that a self-test failure shows up on the first render
-    rather than in the startup log. The message is the same either way,
-    and it still refuses rather than rendering something wrong.
+    Run on first use rather than at import, same as the patches were: the
+    pack sitting in custom_nodes should change nothing at all until you
+    actually chain a clip. The cost is that a failure shows up on the
+    first render instead of in the startup log.
     """
-    if _layout_patch_applied():
-        return
-    if not _apply_layout_patch():
-        raise RuntimeError(
-            "h3_motion_context: the layout patch could not be applied, so "
-            "interior anchors would be rejected by ComfyUI. The reason was "
-            "logged just above this error.")
-
-
-def _ensure_payload_patch():
-    """Install the payload patch, once, before anything needs it.
-
-    Only reached when audio is being pinned, which is the only case where
-    a ref and the keyframes have to coexist.
-    """
-    if _payload_patch_applied():
-        return
-    if not _apply_payload_patch():
-        raise RuntimeError(
-            "h3_motion_context: the payload patch could not be applied. "
-            "Without it the audio ref would overwrite the pinned video "
-            "latents and the motion context would be lost. The reason was "
-            "logged just above this error.")
+    _ensure_layout_contract("pinning a clip")
 
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
@@ -297,7 +267,7 @@ def _audio_tail_from_latent(latent, a_frames):
     lands on .0, .333 or .667 and never on .5, so there are exactly three
     cases:
 
-        frames % 3 == 0   124 -> n/a          exact, overhang  0
+        frames % 3 == 0   243 wants 405.00, allocates 405, overhang    0
         frames % 3 == 1   124 wants 206.67, allocates 207, overhang +1/3
         frames % 3 == 2   260 wants 433.33, allocates 433, overhang -1/3
 
@@ -418,7 +388,7 @@ class MiniMaxH3MotionContext:
         encode_mode, anchor_mode = ENCODE_MODE, ANCHOR_MODE
         audio_mode, crop = AUDIO_MODE, CROP
         context_length = int(context_length)
-        _ensure_layout_patch()
+        _ensure_layout_ok()
 
         video = _video_from_latent(latent)
         latent_t = int(video.shape[2])
@@ -545,20 +515,27 @@ class MiniMaxH3MotionContext:
 
         keyframes = []
         for p, blk in zip(indices, blocks):
+            # Straight to stock. `resolved_frame_index` is the real pixel
+            # frame the block sits at, which ComfyUI 0.33 accepts for any
+            # value, so there is nothing to smuggle and nothing to rewrite
+            # afterwards. One keyframe per latent step rather than a single
+            # multi-step block: `indices` already carries each step's real
+            # offset, which keeps the encode_mode=frames path (offsets
+            # 0..n-1, one still each) on exactly the same code. Stock lays
+            # a 1-step latent at cursor + FRAME_RESCALE * index either way,
+            # so the two forms produce identical rows.
             keyframes.append({
-                # stock code accepts only 0 or frame_count-1 here; the real
-                # position rides under MC_KEY and the layout patch applies it
-                "resolved_frame_index": 0,
-                MC_KEY: p,
+                "resolved_frame_index": p,
                 "latent": blk,
             })
 
         ref_audio_t = 0
         audio_ref = None
+        audio_kf = None
+        audio_end_frame = None
         a_frames = 0
         audio_src = "off"
         if context_latent is not None or context_audio is not None:
-            _ensure_payload_patch()
             # the audio window is independent of the video one: audio cond
             # rows cost rows but never cost delivered frames
             a_frames = int(audio_context_length) or span
@@ -580,22 +557,17 @@ class MiniMaxH3MotionContext:
                     audio_vae, context_audio, a_frames / float(FPS))
                 overhang = 0.0  # decoded audio was match_tail-cut at the frame
                 audio_src = "vae"
-            ref = {
-                "kind": "audio",
-                "ref_audio_t": ref_audio_t,
-                "audio_latent": audio_latent,
-            }
             if audio_mode == "timeline":
                 # end-align the audio window with the pinned video: both are
                 # the tail of clip A, so both must end at the same instant
-                # of the new timeline -- frame `span` in head mode (where
+                # of the new timeline, frame `span` in head mode (where
                 # A's last frame sits), frame 0 in before mode. On the
                 # latent path the sliced content overshoots A's last
                 # frame by `overhang` of a step, signed, because H3
                 # rounds its audio grid to the nearest step and so falls
                 # short as often as it reaches past. The end coordinate
-                # moves by exactly that much; the layout patch takes a
-                # fractional frame index.
+                # moves by exactly that much, and a keyframe index is a
+                # plain multiplier so it takes a fractional frame.
                 end_frame = float(span if anchor_mode == "head" else 0)
                 end_frame += overhang / FRAME_RESCALE
                 # then snap the window onto the target's own audio grid.
@@ -613,51 +585,68 @@ class MiniMaxH3MotionContext:
                 # the same grid as the sound being generated from it.
                 end_coord = round(FRAME_RESCALE * end_frame)
                 end_frame = end_coord / FRAME_RESCALE
-                ref[MC_AUDIO_KEY] = end_frame
-            # APPEND rather than assign. Ref2VA conditioning already
-            # carries the graph's own image, video and audio reference
-            # blocks, and assigning minimax_refs outright would replace
-            # the lot. Applied as a second call so the keyframe values
-            # land first and this one only touches the reference list.
-            audio_ref = ref
+                # Stock places a keyframe's audio window STARTING at
+                # FRAME_RESCALE * index past the target origin and running
+                # forward. We need it to END at the join, so the index is
+                # the start of a window `ref_audio_t` steps wide:
+                #
+                #   start coord = FRAME_RESCALE * end_frame - ref_audio_t
+                #   index       = end_frame - ref_audio_t / FRAME_RESCALE
+                #
+                # which is fractional, and negative whenever the window is
+                # longer than the pinned head, which it normally is. Both
+                # are legal arithmetic in the layout and neither is
+                # reachable through the stock Add Guide node, so
+                # layout_contract checks them before the first render.
+                audio_kf = {
+                    "resolved_frame_index": (end_frame
+                                             - ref_audio_t / FRAME_RESCALE),
+                    "audio_latent": audio_latent,
+                }
+                audio_end_frame = end_frame
+            else:
+                # stock reference placement: the window sits in its own
+                # span ahead of the target, which is what makes the model
+                # imitate the sound rather than continue it. Kept as the
+                # comparison the timeline mode is measured against.
+                audio_ref = {
+                    "kind": "audio",
+                    "ref_audio_t": ref_audio_t,
+                    "audio_latent": audio_latent,
+                }
 
         # MERGE with any keyframes already on the conditioning instead of
-        # replacing them. A last_frame anchor from the upstream node is a
-        # legitimate companion to a chained head: the pinned run decides
-        # how the clip starts, the anchor decides where it ends. Each kept
-        # keyframe is tagged with its own position under MC_KEY so the
-        # layout patch gives it the same reference compensation as ours;
-        # untagged it would either trip the mixed-keyframe guard (with
-        # audio) or sit uncompensated next to compensated anchors (without).
-        # At p = frame_count-1 the patch reproduces stock's coordinate bit
-        # for bit, so tagging changes nothing when no reference is present.
+        # replacing them. A last_frame anchor from the upstream node, or an
+        # Add Guide anchor, is a legitimate companion to a chained head: the
+        # pinned run decides how the clip starts, the anchor decides where
+        # it ends. They need no special handling now that every keyframe
+        # carries its real index, ours included, and stock compensates all
+        # of them for references the same way.
+        #
         # Anchors inside the pinned head are dropped: the pinned run
         # already decides those frames, and a second cond block at the
         # same coordinate would fight it.
         head_end = span if anchor_mode == "head" else 0
+        tail_kfs = [audio_kf] if audio_kf is not None else []
         out = []
         dropped = []
         for emb, extra in conditioning:
             d = extra.copy()
             prior = d.get("minimax_keyframes") or []
-            pfc = d.get("minimax_frame_count")
-            if prior and pfc is not None and int(pfc) != frame_count:
-                raise ValueError(
-                    "h3_motion_context: the conditioning carries keyframes "
-                    "resolved for a %d frame clip, but the latent is %d "
-                    "frames. Wire the conditioning and the latent from the "
-                    "same node." % (int(pfc), frame_count))
             kept = []
             for kf in prior:
-                p = int(kf.get(MC_KEY, kf.get("resolved_frame_index", 0)))
+                p = kf.get("resolved_frame_index", 0)
+                if p >= frame_count:
+                    raise ValueError(
+                        "h3_motion_context: the conditioning carries a "
+                        "keyframe anchored at frame %s, but this clip is "
+                        "only %d frames. Wire the conditioning and the "
+                        "latent from the same node." % (p, frame_count))
                 if p < head_end:
                     dropped.append(p)
                     continue
-                kf = dict(kf)
-                kf[MC_KEY] = p
-                kept.append(kf)
-            d["minimax_keyframes"] = kept + keyframes
-            d["minimax_frame_count"] = frame_count
+                kept.append(dict(kf))
+            d["minimax_keyframes"] = kept + keyframes + tail_kfs
             out.append([emb, d])
         if dropped:
             _LOG.warning(
@@ -678,9 +667,9 @@ class MiniMaxH3MotionContext:
                   indices[0], indices[-1], frame_count, width, height, trim,
                   ("%d frames -> %d latent steps (%.3fs) from %s, %s"
                    % (a_frames, ref_audio_t, ref_audio_t / AUDIO_HZ, audio_src,
-                      "on the timeline ending at frame %.3f"
-                      % float(ref.get(MC_AUDIO_KEY))
-                      if audio_mode == "timeline" else "stock ref placement"))
+                      "on the timeline ending at frame %.3f" % audio_end_frame
+                      if audio_end_frame is not None
+                      else "stock ref placement"))
                   if ref_audio_t else "off")
         return (out, trim)
 
@@ -706,7 +695,7 @@ class MiniMaxH3MotionContextTrim:
     NEAREST step, which means a clip ships either about 8.3 ms more sound
     than picture or about 8.3 ms less, depending on its length:
 
-        frames % 3 == 0   exact
+        frames % 3 == 0   243 wants 405.00 steps, gets 405, exact
         frames % 3 == 1   124 wants 206.67 steps, gets 207, sound is long
         frames % 3 == 2   260 wants 433.33 steps, gets 433, sound is short
 

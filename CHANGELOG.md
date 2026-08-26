@@ -5,9 +5,35 @@ Newest first. Dates are release dates.
 ComfyUI's H3 layout changed shape once so far: `PackedLayout.__init__`
 dropped its `frame_count` parameter along with the restriction that
 rejected any keyframe anchor other than the first or last frame. That
-change is on ComfyUI's master branch and has not been tagged. Every
-release up to v0.33.1 has the older layout. Each entry below says which
-of the two it works with.
+landed in ComfyUI 0.34.0. Every release through 0.33.4 has the older
+layout. Each entry below says which of the two it works with.
+
+## 0.4.0 - 2026-08-26
+
+Requires ComfyUI 0.34.0 or newer. Use 0.3.1 on anything older.
+
+ComfyUI now places keyframe anchors at any frame itself, so the two
+runtime patches this pack carried are gone. Nothing in ComfyUI is
+modified any more.
+
+- `patch_layout.py` and `patch_payload.py` removed. The node builds plain
+  keyframe dicts and hands them to stock code.
+- `layout_contract.py` added. It proves, once before the first render,
+  that anchors sit where the arithmetic says and that the pinned audio
+  window is placed literally from a fractional, negative anchor index.
+  No stock node can produce such an index, so nothing upstream tests it,
+  and an integer cast added later would move the pinned sound silently.
+  If a check fails the node refuses and names what moved.
+- The pinned audio is a keyframe rather than a reference block. A Ref2VA
+  graph's reference list is left untouched.
+- Add Guide for MiniMax H3 anchors survive alongside a chained head,
+  including ones carrying their own audio. Guides landing inside the
+  pinned head are dropped with a warning, as `first_frame` anchors are.
+- Other packs may patch the layout without this one standing down, since
+  it no longer competes for that code. If it finds the constructor
+  wrapped it says who by and checks the behaviour anyway.
+- Anchor and audio window coordinates are identical to 0.3.1, verified
+  against the real upstream layout on both shapes.
 
 ## 0.3.1 - 2026-08-14
 
